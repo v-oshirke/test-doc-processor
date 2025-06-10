@@ -1,0 +1,217 @@
+import azure.functions as func
+import logging
+import json
+import io
+import os
+import pandas as pd
+import asyncio
+
+# Required imports for the async batching logic
+from openai import AsyncAzureOpenAI, RateLimitError, APITimeoutError, OpenAIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# --- You must have these utility functions defined in your 'utils' folder ---
+# from utils.blob_functions import get_blob_content, write_to_blob
+# from utils.azure_openai import create_azure_openai_client 
+# -------------------------------------------------------------------------
+
+# Dummy functions so this file can be understood without your utils.
+# In your project, you will use your actual functions.
+def get_blob_content(container, blob):
+    # In your code, this reads from Azure Blob Storage and returns bytes.
+    # This is a placeholder.
+    logging.warning(f"DUMMY FUNCTION: Reading {container}/{blob}")
+    # Create a dummy excel in memory for testing
+    output = io.BytesIO()
+    dummy_data = {
+        'Line Item Description': [f'Description {i} for {blob}' for i in range(5)],
+        'Concept Label': [f'Label {i}' for i in range(5)],
+        'Comment Text': [f'Comment {i}' for i in range(5)]
+    }
+    df = pd.DataFrame(dummy_data)
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name='Filing Details', index=False)
+    return output.getvalue()
+
+def write_to_blob(container, blob_name, data):
+    # In your code, this writes to Azure Blob Storage.
+    logging.info(f"DUMMY FUNCTION: Writing {len(data)} bytes to {container}/{blob_name}")
+    pass
+
+def create_azure_openai_client():
+    # In your code, this reads environment variables and returns the async client and model name.
+    logging.info("DUMMY FUNCTION: Creating Azure OpenAI Client")
+    return AsyncAzureOpenAI(api_key="dummy", azure_endpoint="dummy", api_version="dummy"), "gpt-4"
+# --- End of Dummy Functions ---
+
+
+# 1. SYSTEM PROMPT FOR BATCHING
+SYSTEM_PROMPT = """
+You are an iXBRL financial statement tagging review assistant.
+Your task is to analyze a list of financial line items. For each item, you will be given a 'Line Item Description', a 'Concept Label', and contextual 'Comment Text'.
+
+You will receive a JSON array of items to validate.
+Your response MUST be a single JSON object containing a key "results", which is a JSON array of validation objects. Each validation object in the array must correspond to an item in the input array, in the same order.
+
+Each validation object must have two keys: "status" (e.g., "MATCH", "MISMATCH", "MISSING_DATA") and "reason".
+
+Validation Rule for each item:
+- The Concept Label must be the most accurate XBRL-style tag for the Line Item Description, considering the Comment Text for context.
+- If the label is a good match, respond with 'MATCH'.
+- If the label is a mismatch, respond with 'MISMATCH' and provide a brief reason and a suggested correct label.
+- If data is missing, state what is missing.
+"""
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_exception_type((RateLimitError, APITimeoutError, OpenAIError)),
+    reraise=True
+)
+async def get_llm_validation_for_batch(batch_data: list, semaphore: asyncio.Semaphore, client: AsyncAzureOpenAI, model_name: str) -> list:
+    """Sends a batch of rows to Azure OpenAI for validation."""
+    async with semaphore:
+        # Prepare the data, including Comment Text for better context
+        input_data_for_llm = [
+            {
+                "description": row.get("Line Item Description", "N/A"),
+                "label": row.get("Concept Label", "N/A"),
+                "comment": row.get("Comment Text", "N/A")
+            }
+            for row in batch_data
+        ]
+        
+        user_prompt = json.dumps(input_data_for_llm, indent=2)
+
+        try:
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=4096,  # Increased for larger batches
+                temperature=0,
+                response_format={"type": "json_object"}
+            )
+            result_str = response.choices[0].message.content
+            logging.info(f"✅ Reviewed a batch of {len(batch_data)} items.")
+            parsed_json = json.loads(result_str)
+            return parsed_json.get("results", [])
+
+        except Exception as e:
+            logging.error(f"❌ Error after retries for a batch of {len(batch_data)} items: {e}")
+            return [{"status": "BATCH_ERROR", "reason": str(e)}] * len(batch_data)
+
+async def validate_financial_data(json_data: list, client: AsyncAzureOpenAI, model_name: str, batch_size: int, concurrent_requests: int) -> list:
+    """The main asynchronous function to process a list of financial data rows using batching."""
+    semaphore = asyncio.Semaphore(concurrent_requests)
+    batches = [json_data[i:i + batch_size] for i in range(0, len(json_data), batch_size)]
+    
+    logging.info(f"🚀 Starting validation for {len(json_data)} rows, broken into {len(batches)} batches of size ~{batch_size}.")
+    
+    tasks = [get_llm_validation_for_batch(batch, semaphore, client, model_name) for batch in batches]
+    batch_results = await asyncio.gather(*tasks)
+
+    logging.info("\n🏁 Validation complete. Processing results...")
+    all_results = [item for sublist in batch_results for item in sublist]
+
+    # Add the LLM results back to the original data
+    for i, result_json in enumerate(all_results):
+        if i < len(json_data):
+            try:
+                json_data[i]['LLM_Status'] = result_json.get("status", "PARSE_ERROR")
+                json_data[i]['LLM_Reason'] = result_json.get("reason", "Could not parse LLM response.")
+            except (AttributeError, TypeError):
+                json_data[i]['LLM_Status'] = "PARSE_ERROR"
+                json_data[i]['LLM_Reason'] = str(result_json)
+    return json_data
+
+
+# --- MAIN AZURE FUNCTION ---
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Python HTTP trigger function processed a request using async batching.')
+    try:
+        req_body = req.get_json()
+        selected_blobs = req_body.get("blobs", [])
+ 
+        if not selected_blobs:
+            return func.HttpResponse(json.dumps({"error": "No blobs provided."}), status_code=400, mimetype="application/json")
+
+        all_rows_to_validate = []
+        errors = []
+
+        # STEP 1: Read and aggregate all data from all files first.
+        logging.info(f"Step 1: Reading and parsing {len(selected_blobs)} blob(s)...")
+        for blob in selected_blobs:
+            blob_name = blob.get("name")
+            container_name = blob.get("container", "silver")
+            
+            if container_name == "bronze":
+                errors.append(f"Skipping disallowed blob: {blob_name}")
+                continue
+            
+            try:
+                blob_bytes = get_blob_content(container_name, blob_name)
+                df = pd.read_excel(io.BytesIO(blob_bytes), sheet_name='Filing Details')
+                df_filtered = df[['Line Item Description', 'Concept Label', 'Comment Text']].dropna(subset=['Line Item Description', 'Concept Label'], how='any')
+
+                # Add a source_blob key for traceability
+                rows = df_filtered.to_dict(orient='records')
+                for row in rows:
+                    row['source_blob'] = blob_name
+                
+                all_rows_to_validate.extend(rows)
+            except Exception as e:
+                error_msg = f"Error reading or parsing blob {blob_name}: {str(e)}"
+                logging.error(error_msg)
+                errors.append(error_msg)
+
+        if not all_rows_to_validate:
+            return func.HttpResponse(json.dumps({"error": "No valid data rows found in the provided files.", "details": errors}), status_code=400, mimetype="application/json")
+
+        # STEP 2: Run the high-speed async validation on the aggregated data.
+        validated_data = []
+        try:
+            logging.info(f"Step 2: Starting LLM validation for {len(all_rows_to_validate)} total rows.")
+            client, model_name = create_azure_openai_client()
+            
+            # Use asyncio.run() to execute the async logic from our sync function
+            # Use larger batches and fewer concurrent requests to avoid rate limits
+            validated_data = asyncio.run(
+                validate_financial_data(
+                    json_data=all_rows_to_validate,
+                    client=client,
+                    model_name=model_name,
+                    batch_size=30,          # More rows per request
+                    concurrent_requests=3   # Fewer parallel requests
+                )
+            )
+        except Exception as e:
+            errors.append(f"A critical error occurred during LLM validation: {str(e)}")
+            logging.error(f"LLM Validation Error: {e}", exc_info=True)
+
+
+        # STEP 3: Write the single, combined result to a blob and return a success response.
+        logging.info("Step 3: Writing results to blob storage.")
+        output_name = f"validated-output-{pd.Timestamp.now().strftime('%Y%m%d-%H%M%S')}.json"
+        write_to_blob("gold", output_name, json.dumps(validated_data, indent=2).encode('utf-8'))
+
+        return func.HttpResponse(
+            json.dumps({
+                "message": f"Successfully validated {len(validated_data)} rows.",
+                "outputFile": output_name,
+                "container": "gold",
+                "errors": errors
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+ 
+    except Exception as e:
+        logging.error(f"Unhandled error in main function: {str(e)}", exc_info=True)
+        return func.HttpResponse(
+            json.dumps({"error": "An unexpected internal server error occurred.", "details": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
